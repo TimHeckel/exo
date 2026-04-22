@@ -4,6 +4,7 @@ import hashlib
 import json
 import random
 import time
+from collections import defaultdict
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -172,6 +173,7 @@ from exo.shared.types.events import (
     Event,
     IndexedEvent,
     InstanceDeleted,
+    NodeTimedOut,
     TracesMerged,
 )
 from exo.shared.types.memory import Memory
@@ -185,7 +187,11 @@ from exo.shared.types.tasks import (
 from exo.shared.types.tasks import (
     TextGeneration as TextGenerationTask,
 )
-from exo.shared.types.text_generation import Base64Image, TextGenerationTaskParams
+from exo.shared.types.text_generation import (
+    Base64Image,
+    Base64ImageHash,
+    TextGenerationTaskParams,
+)
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import Instance, InstanceId, InstanceMeta
 from exo.shared.types.worker.shards import Sharding
@@ -269,6 +275,9 @@ class API:
             CommandId, Sender[ImageChunk | ErrorChunk]
         ] = {}
         self._image_store = ImageStore(EXO_IMAGE_CACHE_DIR)
+        self._sent_image_hashes: defaultdict[NodeId, set[Base64ImageHash]] = (
+            defaultdict(set)
+        )
         self._tg: TaskGroup = TaskGroup()
 
     def reset(self, result_clock: int, event_receiver: Receiver[IndexedEvent]):
@@ -279,6 +288,7 @@ class API:
         self._system_id = SystemId()
         self._text_generation_queues = {}
         self._image_generation_queues = {}
+        self._sent_image_hashes = defaultdict(set)
         self.unpause(result_clock)
         self.event_receiver.close()
         self.event_receiver = event_receiver
@@ -737,7 +747,12 @@ class API:
             "TODO: we should send a notification to the user to download the model"
         )
 
-    _sent_image_hashes: set[str] = set()
+    def _is_hash_cached_on_all_workers(
+        self, h: Base64ImageHash, workers: list[NodeId]
+    ) -> bool:
+        return bool(workers) and all(
+            h in self._sent_image_hashes[node] for node in workers
+        )
 
     async def _send_text_generation_with_images(
         self, task_params: TextGenerationTaskParams
@@ -749,36 +764,38 @@ class API:
             await self._send(command)
             return command
 
-        hashes = [hashlib.sha256(img.encode("ascii")).hexdigest() for img in images]
+        hashes = [
+            Base64ImageHash(hashlib.sha256(img.encode("ascii")).hexdigest())
+            for img in images
+        ]
 
-        cached_hashes: dict[int, str] = {}
-        new_images: list[tuple[int, str]] = []
+        current_workers: list[NodeId] = list(self.state.topology.list_nodes())
+
+        cached_hashes: dict[int, Base64ImageHash] = {}
+        new_images: list[tuple[int, Base64Image, Base64ImageHash]] = []
         for idx, (img, h) in enumerate(zip(images, hashes, strict=True)):
-            if h in self._sent_image_hashes:
+            if self._is_hash_cached_on_all_workers(h, current_workers):
                 cached_hashes[idx] = h
             else:
-                self._sent_image_hashes.add(h)
-                new_images.append((idx, img))
-
-        wrapped_hashes = {idx: Base64Image(h) for idx, h in cached_hashes.items()}
+                new_images.append((idx, img, h))
 
         if not new_images:
             task_params = task_params.model_copy(
-                update={"images": [], "image_hashes": wrapped_hashes}
+                update={"images": [], "image_hashes": cached_hashes}
             )
             command = TextGeneration(task_params=task_params)
             await self._send(command)
             return command
 
         all_chunks: list[tuple[int, str]] = []
-        for img_idx, img_data in new_images:
+        for img_idx, img_data, _ in new_images:
             for i in range(0, len(img_data), EXO_MAX_CHUNK_SIZE):
                 all_chunks.append((img_idx, img_data[i : i + EXO_MAX_CHUNK_SIZE]))
 
         task_params = task_params.model_copy(
             update={
                 "images": [],
-                "image_hashes": wrapped_hashes,
+                "image_hashes": cached_hashes,
                 "total_input_chunks": len(all_chunks),
                 "image_count": len(new_images),
             }
@@ -798,6 +815,10 @@ class API:
                     )
                 )
             )
+
+        newly_sent = {h for _, _, h in new_images}
+        for node in current_workers:
+            self._sent_image_hashes[node].update(newly_sent)
 
         await self._send(command)
         return command
@@ -1830,6 +1851,8 @@ class API:
                             self._text_generation_queues.pop(event.command_id, None)
                 if isinstance(event, InstanceDeleted):
                     self._close_streams_for_instance(event.instance_id)
+                if isinstance(event, NodeTimedOut):
+                    self._sent_image_hashes.pop(event.node_id)
                 if isinstance(event, TracesMerged):
                     self._save_merged_trace(event)
 

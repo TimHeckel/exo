@@ -315,7 +315,12 @@ class Worker:
                     by_index: dict[int, Base64Image] = {}
 
                     for idx, h in task.task_params.image_hashes.items():
-                        assert h in self.image_cache
+                        # Remove all this when sending from the API is fast
+                        if h not in self.image_cache:
+                            logger.critical(
+                                "Image hash not found in cache, image may be corrupted"
+                            )
+                            continue
                         by_index[idx] = self.image_cache[h]
 
                     if task.task_params.total_input_chunks > 0:
