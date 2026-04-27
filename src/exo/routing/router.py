@@ -249,11 +249,10 @@ def get_node_id_keypair(
     Obtains the :class:`Keypair` associated with this node-ID.
     Obtain the :class:`PeerId` by from it.
     """
-    # TODO(evan): bring back node id persistence once we figure out how to deal with duplicates
-    return Keypair.generate()
-
     def lock_path(path: str | bytes | PathLike[str] | PathLike[bytes]) -> Path:
         return Path(str(path) + ".lock")
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
 
     # operate with cross-process lock to avoid race conditions
     with FileLock(lock_path(path)):

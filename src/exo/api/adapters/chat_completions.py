@@ -169,6 +169,7 @@ async def chat_request_to_text_generation(
         repetition_penalty=request.repetition_penalty,
         repetition_context_size=request.repetition_context_size,
         images=images,
+        use_prefix_cache=request.use_prefix_cache,
     )
 
 
