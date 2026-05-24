@@ -122,6 +122,7 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
     chat_template_messages: list[dict[str, ChatTemplateValue]] | None = None
     reasoning_effort: ReasoningEffort | None = None
     enable_thinking: bool | None = None
+    thinking_budget_tokens: int | None = None
     logprobs: bool = False
     top_logprobs: int | None = None
     min_p: float | None = None

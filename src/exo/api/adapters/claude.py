@@ -80,6 +80,7 @@ def _extract_tool_result_text(block: ClaudeToolResultBlock) -> str:
 # or similar telemetry headers that change every request and break KV prefix caching.
 _VOLATILE_HEADER_RE = re.compile(r"^x-anthropic-[^\n]*;\n?", re.MULTILINE)
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+_DEFAULT_THINKING_BUDGET_CAP = 2048
 
 
 def _force_disable_thinking() -> bool:
@@ -87,6 +88,34 @@ def _force_disable_thinking() -> bool:
         os.environ.get("EXO_CLAUDE_DISABLE_THINKING", "").strip().lower()
         in _TRUE_ENV_VALUES
     )
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(f"Ignoring invalid integer env {name}={raw!r}")
+        return default
+
+
+def _resolve_thinking_budget(
+    request: ClaudeMessagesRequest, enable_thinking: bool | None
+) -> int | None:
+    if not enable_thinking or request.thinking is None:
+        return None
+
+    max_tokens = max(1, request.max_tokens)
+    requested_budget = request.thinking.budget_tokens
+    cap = max(1, _env_int("EXO_CLAUDE_THINKING_BUDGET_CAP", _DEFAULT_THINKING_BUDGET_CAP))
+    proportional_reserve = max(8, max_tokens // 4)
+    configured_reserve = _env_int("EXO_CLAUDE_THINKING_FINAL_RESERVE", 1024)
+    final_reserve = min(configured_reserve, proportional_reserve)
+    max_budget = max(1, max_tokens - final_reserve)
+    budget = requested_budget if requested_budget is not None else max_budget
+    return min(budget, cap, max_budget)
 
 
 
@@ -250,6 +279,7 @@ async def claude_request_to_text_generation(
     if _force_disable_thinking():
         enable_thinking = False
 
+    thinking_budget_tokens = _resolve_thinking_budget(request, enable_thinking)
     return TextGenerationTaskParams(
         model=request.model,
         input=input_messages
@@ -267,6 +297,7 @@ async def claude_request_to_text_generation(
         chat_template_messages=chat_template_messages
         if chat_template_messages
         else None,
+        thinking_budget_tokens=thinking_budget_tokens,
         images=images,
     )
 

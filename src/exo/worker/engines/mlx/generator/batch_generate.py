@@ -37,6 +37,7 @@ from exo.worker.engines.mlx.generator.generate import (
     ban_token_ids,
     eos_ids_from_tokenizer,
     extract_top_logprobs,
+    force_think_end_after_budget,
     patch_embed_tokens,
     prefill,
 )
@@ -295,6 +296,12 @@ class ExoBatchGenerator:
             # Only sample length eos tokens
             eos_ids = eos_ids_from_tokenizer(self.tokenizer)
             logits_processors = [ban_token_ids(eos_ids)] + logits_processors
+        think_budget_processor = force_think_end_after_budget(
+            self.tokenizer,
+            task_params.thinking_budget_tokens if task_params.enable_thinking else None,
+        )
+        if think_budget_processor is not None:
+            logits_processors = [think_budget_processor] + logits_processors
 
         max_tokens = task_params.max_output_tokens or MAX_TOKENS
 

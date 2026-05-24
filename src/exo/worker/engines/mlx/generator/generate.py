@@ -472,6 +472,47 @@ def ban_token_ids(token_ids: list[int]) -> Callable[[mx.array, mx.array], mx.arr
 
     return proc
 
+def force_think_end_after_budget(
+    tokenizer: TokenizerWrapper, budget_tokens: int | None
+) -> Callable[[mx.array, mx.array], mx.array] | None:
+    """Force a model out of `<think>` once its reasoning budget is exhausted."""
+    if budget_tokens is None or budget_tokens <= 0:
+        return None
+    if not getattr(tokenizer, "has_thinking", False):
+        return None
+
+    think_start = getattr(tokenizer, "think_start", None)
+    think_end = getattr(tokenizer, "think_end", None)
+    if not isinstance(think_start, str) or not isinstance(think_end, str):
+        return None
+
+    start_ids = tokenizer.encode(think_start, add_special_tokens=False)
+    end_ids = tokenizer.encode(think_end, add_special_tokens=False)
+    if len(start_ids) != 1 or len(end_ids) != 1:
+        logger.warning("Thinking budget enforcement requires single-token think tags")
+        return None
+
+    start_token = int(start_ids[0])
+    end_token = int(end_ids[0])
+    budget = int(budget_tokens)
+
+    def proc(history: mx.array, logits: mx.array) -> mx.array:
+        tokens = [int(t) for t in history.tolist()]
+        last_start = -1
+        last_end = -1
+        for idx, token in enumerate(tokens):
+            if token == start_token:
+                last_start = idx
+            elif token == end_token:
+                last_end = idx
+
+        if last_start > last_end and len(tokens) - last_start - 1 >= budget:
+            logits[...] = -1e9
+            logits[..., end_token] = 0
+        return logits
+
+    return proc
+
 
 def eos_ids_from_tokenizer(tokenizer: TokenizerWrapper) -> list[int]:
     eos: list[int] | None = getattr(tokenizer, "eos_token_ids", None)
@@ -610,6 +651,11 @@ def mlx_generate(
         # Only sample length eos tokens
         eos_ids = eos_ids_from_tokenizer(tokenizer)
         logits_processors = [ban_token_ids(eos_ids)] + logits_processors
+    think_budget_processor = force_think_end_after_budget(
+        tokenizer, task.thinking_budget_tokens if task.enable_thinking else None
+    )
+    if think_budget_processor is not None:
+        logits_processors = [think_budget_processor] + logits_processors
 
     sampler = make_sampler(
         temp=task.temperature if task.temperature is not None else 0.7,
