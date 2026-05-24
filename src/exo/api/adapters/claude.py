@@ -81,6 +81,7 @@ def _extract_tool_result_text(block: ClaudeToolResultBlock) -> str:
 _VOLATILE_HEADER_RE = re.compile(r"^x-anthropic-[^\n]*;\n?", re.MULTILINE)
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 _DEFAULT_THINKING_BUDGET_CAP = 2048
+_THINKING_TAG_RE = re.compile(r"</?think>\s*")
 
 
 def _force_disable_thinking() -> bool:
@@ -116,6 +117,10 @@ def _resolve_thinking_budget(
     max_budget = max(1, max_tokens - final_reserve)
     budget = requested_budget if requested_budget is not None else max_budget
     return min(budget, cap, max_budget)
+def _strip_thinking_tags(text: str) -> str:
+    return _THINKING_TAG_RE.sub("", text)
+
+
 
 
 
@@ -344,7 +349,7 @@ async def collect_claude_response(
         if chunk.is_thinking:
             thinking_parts.append(chunk.text)
         else:
-            text_parts.append(chunk.text)
+            text_parts.append(_strip_thinking_tags(chunk.text))
 
         if chunk.finish_reason is not None:
             stop_reason = finish_reason_to_claude_stop_reason(chunk.finish_reason)
@@ -475,6 +480,7 @@ async def generate_claude_stream(
             )
             yield f"event: content_block_delta\ndata: {delta_event.model_dump_json()}\n\n"
         else:
+            text = _strip_thinking_tags(chunk.text)
             # Close thinking block when transitioning to text
             if thinking_block_started and text_block_index == -1:
                 block_stop = ClaudeContentBlockStopEvent(index=thinking_block_index)
@@ -493,7 +499,7 @@ async def generate_claude_stream(
 
             delta_event = ClaudeContentBlockDeltaEvent(
                 index=text_block_index,
-                delta=ClaudeTextDelta(text=chunk.text),
+                delta=ClaudeTextDelta(text=text),
             )
             yield f"event: content_block_delta\ndata: {delta_event.model_dump_json()}\n\n"
 
