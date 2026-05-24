@@ -378,6 +378,13 @@ def parse_thinking_models(
             yield buffered.model_copy(update={"is_thinking": _is_thinking})
         pending_buffer.clear()
 
+    def strip_think_tags(text: str) -> str:
+        if think_start:
+            text = text.replace(think_start, "")
+        if think_end:
+            text = text.replace(think_end, "")
+        return text
+
     for response in responses:
         if response is None:
             yield None
@@ -387,7 +394,8 @@ def parse_thinking_models(
 
         if response.finish_reason is not None:
             yield from drain_pending(is_thinking)
-            yield response.model_copy(update={"is_thinking": False})
+            text = strip_think_tags(response.text)
+            yield response.model_copy(update={"text": text, "is_thinking": False})
             continue
 
         if accumulated == think_start and not is_thinking:
@@ -401,6 +409,16 @@ def parse_thinking_models(
             pending_buffer.clear()
             continue
 
+        if think_end and is_thinking and think_end in accumulated:
+            _, after = accumulated.split(think_end, 1)
+            is_thinking = False
+            accumulated = ""
+            pending_buffer.clear()
+            text = strip_think_tags(after)
+            if text:
+                yield response.model_copy(update={"text": text, "is_thinking": False})
+            continue
+
         if (think_start and accumulated == think_start[: len(accumulated)]) or (
             think_end and accumulated == think_end[: len(accumulated)]
         ):
@@ -410,7 +428,9 @@ def parse_thinking_models(
         accumulated = ""
 
         yield from drain_pending(is_thinking)
-        yield response.model_copy(update={"is_thinking": is_thinking})
+        text = response.text if is_thinking else strip_think_tags(response.text)
+        if text:
+            yield response.model_copy(update={"text": text, "is_thinking": is_thinking})
 
 
 def parse_tool_calls(
