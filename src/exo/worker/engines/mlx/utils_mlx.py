@@ -295,6 +295,16 @@ def get_tokenizer(model_path: Path, shard_metadata: ShardMetadata) -> TokenizerW
     )
 
 
+def _is_qwen35_or_qwen36_model(model_id: ModelId) -> bool:
+    model_id_lower = str(model_id).lower()
+    return (
+        "qwen3.5" in model_id_lower
+        or "qwen-3.5" in model_id_lower
+        or "qwen3.6" in model_id_lower
+        or "qwen-3.6" in model_id_lower
+    )
+
+
 def get_eos_token_ids_for_model(model_id: ModelId) -> list[int] | None:
     """
     Get the EOS token IDs for a model based on its ID.
@@ -319,12 +329,7 @@ def get_eos_token_ids_for_model(model_id: ModelId) -> list[int] | None:
         return [151336, 151329, 151338]
     elif "gpt-oss" in model_id_lower:
         return [200002, 200012]
-    elif (
-        "qwen3.5" in model_id_lower
-        or "qwen-3.5" in model_id_lower
-        or "qwen3.6" in model_id_lower
-        or "qwen-3.6" in model_id_lower
-    ):
+    elif _is_qwen35_or_qwen36_model(model_id):
         # For Qwen3.5 / Qwen3.6: 248046 (<|im_end|>), 248044 (<|endoftext|>)
         return [248046, 248044]
     elif "gemma-4" in model_id_lower or "gemma-3" in model_id_lower:
@@ -624,6 +629,11 @@ def render_chat_template(
         # Jinja ignores unknown variables, so passing both is safe.
         extra_kwargs["enable_thinking"] = task_params.enable_thinking
         extra_kwargs["thinking"] = task_params.enable_thinking
+    elif _is_qwen35_or_qwen36_model(task_params.model):
+        # Qwen 3.5/3.6 templates default to an open <think> block unless this is
+        # explicitly disabled, which can consume the whole response budget.
+        extra_kwargs["enable_thinking"] = False
+        extra_kwargs["thinking"] = False
     if task_params.reasoning_effort is not None:
         extra_kwargs["reasoning_effort"] = task_params.reasoning_effort
 

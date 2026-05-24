@@ -1,6 +1,7 @@
 """Claude Messages API adapter for converting requests/responses."""
 
 import json
+import os
 import re
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -78,6 +79,15 @@ def _extract_tool_result_text(block: ClaudeToolResultBlock) -> str:
 # Matches "x-anthropic-billing-header: ...;" (with optional trailing newline)
 # or similar telemetry headers that change every request and break KV prefix caching.
 _VOLATILE_HEADER_RE = re.compile(r"^x-anthropic-[^\n]*;\n?", re.MULTILINE)
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _force_disable_thinking() -> bool:
+    return (
+        os.environ.get("EXO_CLAUDE_DISABLE_THINKING", "").strip().lower()
+        in _TRUE_ENV_VALUES
+    )
+
 
 
 def _strip_volatile_headers(text: str) -> str:
@@ -237,6 +247,8 @@ async def claude_request_to_text_generation(
     enable_thinking: bool | None = None
     if request.thinking is not None:
         enable_thinking = request.thinking.type in ("enabled", "adaptive")
+    if _force_disable_thinking():
+        enable_thinking = False
 
     return TextGenerationTaskParams(
         model=request.model,
