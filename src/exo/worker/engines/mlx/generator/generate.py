@@ -510,6 +510,10 @@ def force_think_end_after_budget(
             forced_logits = mx.zeros_like(logits) - 1e9
             forced_logits[..., end_token] = 0
             return forced_logits
+        elif last_end >= 0:
+            logits[..., start_token] = -1e9
+            logits[..., end_token] = -1e9
+
         return logits
 
     return proc
