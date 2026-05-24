@@ -507,8 +507,9 @@ def force_think_end_after_budget(
                 last_end = idx
 
         if last_start > last_end and len(tokens) - last_start - 1 >= budget:
-            logits[...] = -1e9
-            logits[..., end_token] = 0
+            forced_logits = mx.zeros_like(logits) - 1e9
+            forced_logits[..., end_token] = 0
+            return forced_logits
         return logits
 
     return proc
