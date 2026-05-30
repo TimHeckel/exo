@@ -151,6 +151,27 @@ def _log_balancer_choice(
         logger.warning(f"[balancer] diagnostics failed: {exc!r}")
 
 
+# Round-robin cursor per model, used only to break ties between replicas that
+# are equally (least) loaded. Master is a single process and the command
+# processor handles commands one at a time, so no locking is needed.
+_BALANCER_RR: dict[str, int] = {}
+
+
+def _select_balanced_instance(
+    instance_task_counts: dict[InstanceId, int], model: str
+) -> InstanceId:
+    """Pick the least in-flight instance; round-robin among those tied at the
+    minimum so sequential traffic alternates across replicas instead of always
+    pinning to the same one. Under real concurrency this is still least-loaded."""
+    min_count = min(instance_task_counts.values())
+    tied = sorted(iid for iid, c in instance_task_counts.items() if c == min_count)
+    if len(tied) == 1:
+        return tied[0]
+    idx = _BALANCER_RR.get(model, 0) % len(tied)
+    _BALANCER_RR[model] = idx + 1
+    return tied[idx]
+
+
 class Master:
     def __init__(
         self,
@@ -245,14 +266,9 @@ class Master:
                                     f"No instance found for model {command.task_params.model}"
                                 )
 
-                            available_instance_ids = sorted(
-                                instance_task_counts.keys(),
-                                key=lambda instance_id: instance_task_counts[
-                                    instance_id
-                                ],
+                            decode_instance_id = _select_balanced_instance(
+                                instance_task_counts, command.task_params.model
                             )
-
-                            decode_instance_id = available_instance_ids[0]
                             _log_balancer_choice(
                                 self.state,
                                 command.task_params.model,
@@ -302,15 +318,10 @@ class Master:
                                     f"No instance found for model {command.task_params.model}"
                                 )
 
-                            available_instance_ids = sorted(
-                                instance_task_counts.keys(),
-                                key=lambda instance_id: instance_task_counts[
-                                    instance_id
-                                ],
-                            )
-
                             task_id = TaskId()
-                            selected_instance_id = available_instance_ids[0]
+                            selected_instance_id = _select_balanced_instance(
+                                instance_task_counts, command.task_params.model
+                            )
                             _log_balancer_choice(
                                 self.state,
                                 command.task_params.model,
@@ -364,15 +375,10 @@ class Master:
                                     f"No instance found for model {command.task_params.model}"
                                 )
 
-                            available_instance_ids = sorted(
-                                instance_task_counts.keys(),
-                                key=lambda instance_id: instance_task_counts[
-                                    instance_id
-                                ],
-                            )
-
                             task_id = TaskId()
-                            selected_instance_id = available_instance_ids[0]
+                            selected_instance_id = _select_balanced_instance(
+                                instance_task_counts, command.task_params.model
+                            )
                             _log_balancer_choice(
                                 self.state,
                                 command.task_params.model,
