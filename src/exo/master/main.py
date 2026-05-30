@@ -119,6 +119,38 @@ def _prefill_endpoint_for(state: State, decode_instance_id: InstanceId) -> str |
     return None
 
 
+def _balancer_instance_label(state: State, instance_id: InstanceId) -> str:
+    """'shortid(node1,node2)' label for load-balancer diagnostics."""
+    inst = state.instances.get(instance_id)
+    if inst is None:
+        return str(instance_id)[:8]
+    names: list[str] = []
+    for node_id in inst.shard_assignments.node_to_runner:
+        ident = state.node_identities.get(node_id)
+        names.append(ident.friendly_name if ident is not None else str(node_id)[:8])
+    return f"{str(instance_id)[:8]}({','.join(names) if names else '?'})"
+
+
+def _log_balancer_choice(
+    state: State,
+    model: str,
+    instance_task_counts: dict[InstanceId, int],
+    chosen_id: InstanceId,
+) -> None:
+    """Always-on diagnostics: candidate replicas, their in-flight task counts,
+    and which one the least-loaded balancer picked. Never raises."""
+    try:
+        ranked = sorted(instance_task_counts.items(), key=lambda kv: kv[1])
+        parts = [
+            f"{_balancer_instance_label(state, iid)} inflight={count}"
+            + (" <=CHOSEN" if iid == chosen_id else "")
+            for iid, count in ranked
+        ]
+        logger.info(f"[balancer] model={model} | " + " | ".join(parts))
+    except Exception as exc:  # diagnostics must never break the master loop
+        logger.warning(f"[balancer] diagnostics failed: {exc!r}")
+
+
 class Master:
     def __init__(
         self,
@@ -221,6 +253,12 @@ class Master:
                             )
 
                             decode_instance_id = available_instance_ids[0]
+                            _log_balancer_choice(
+                                self.state,
+                                command.task_params.model,
+                                instance_task_counts,
+                                decode_instance_id,
+                            )
                             task_id = TaskId()
                             params = command.task_params.model_copy(
                                 update={
@@ -273,6 +311,12 @@ class Master:
 
                             task_id = TaskId()
                             selected_instance_id = available_instance_ids[0]
+                            _log_balancer_choice(
+                                self.state,
+                                command.task_params.model,
+                                instance_task_counts,
+                                selected_instance_id,
+                            )
                             generated_events.append(
                                 TaskCreated(
                                     task_id=task_id,
@@ -329,6 +373,12 @@ class Master:
 
                             task_id = TaskId()
                             selected_instance_id = available_instance_ids[0]
+                            _log_balancer_choice(
+                                self.state,
+                                command.task_params.model,
+                                instance_task_counts,
+                                selected_instance_id,
+                            )
                             generated_events.append(
                                 TaskCreated(
                                     task_id=task_id,
