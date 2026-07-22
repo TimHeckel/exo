@@ -29,11 +29,14 @@ from exo.shared.types.worker.runner_response import GenerationResponse
 from exo.worker.engines.mlx.cache import (
     CacheSnapshot,
     KVPrefixCache,
+    cache_length,
     encode_prompt,
+    has_non_kv_caches,
     make_kv_cache,
 )
 from exo.worker.engines.mlx.constants import DEFAULT_TOP_LOGPROBS, MAX_TOKENS
 from exo.worker.engines.mlx.generator.generate import (
+    PrefillCancelled,
     ban_token_ids,
     eos_ids_from_tokenizer,
     extract_top_logprobs,
@@ -232,16 +235,32 @@ class ExoBatchGenerator:
                     )
 
             if not remote_prefilled:
-                _prefill_tps, _prefill_tokens, cache_snapshots = prefill(
-                    self.model,
-                    self.tokenizer,
-                    sampler,
-                    prompt_tokens[:-1],
-                    cache,
-                    self.group,
-                    on_prefill_progress,
-                    distributed_prompt_progress_callback,
-                )
+                try:
+                    _prefill_tps, _prefill_tokens, cache_snapshots = prefill(
+                        self.model,
+                        self.tokenizer,
+                        sampler,
+                        prompt_tokens[:-1],
+                        cache,
+                        self.group,
+                        on_prefill_progress,
+                        distributed_prompt_progress_callback,
+                        snapshots_sink=cache_snapshots,
+                    )
+                except PrefillCancelled:
+                    # Bank the partially-filled cache so a retry of the same
+                    # prompt resumes here instead of starting over. Client
+                    # timeouts on multi-minute prefills otherwise cancel-retry
+                    # forever, each attempt re-prefilling from zero.
+                    self._bank_partial_prefill(
+                        all_prompt_tokens,
+                        cache,
+                        cache_snapshots,
+                        matched_index,
+                        prefix_hit_length,
+                        media_regions,
+                    )
+                    raise
 
         prefix_cache_hit: Literal["none", "partial", "exact"] = "none"
         if matched_index is not None and prefix_hit_length > 0:
@@ -496,6 +515,51 @@ class ExoBatchGenerator:
     def close(self) -> None:
         self._mlx_gen.close()
         mx.clear_cache()
+
+    def _bank_partial_prefill(
+        self,
+        all_prompt_tokens: mx.array,
+        cache: KVCacheType,
+        snapshots: list[CacheSnapshot],
+        matched_index: int | None,
+        prefix_hit_length: int,
+        media_regions: list[MediaRegion] | None,
+    ) -> None:
+        """Save a cancelled prefill's partial cache so retries resume from it."""
+        if self.kv_prefix_cache is None:
+            return
+        try:
+            banked = cache_length(cache)
+            if has_non_kv_caches(cache):
+                # Rotating/SSM caches restore only at snapshot positions
+                if not snapshots:
+                    return
+                banked = min(banked, snapshots[-1].token_count)
+            if banked <= 4096 or banked > len(all_prompt_tokens):
+                return
+            prompt_prefix = all_prompt_tokens[:banked]
+            if matched_index is not None:
+                self.kv_prefix_cache.update_kv_cache(
+                    matched_index,
+                    prompt_prefix,
+                    cache,
+                    snapshots or None,
+                    restore_pos=prefix_hit_length,
+                    media_regions=media_regions,
+                )
+            else:
+                self.kv_prefix_cache.add_kv_cache(
+                    prompt_prefix,
+                    cache,
+                    snapshots or None,
+                    media_regions=media_regions,
+                )
+            logger.info(
+                f"Banked partial prefill: {banked}/{len(all_prompt_tokens)} "
+                f"tokens for retry resume"
+            )
+        except Exception:
+            logger.warning("Failed to bank partial prefill", exc_info=True)
 
     def _save_prefix_cache(
         self,

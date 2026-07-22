@@ -288,11 +288,16 @@ def prefill(
     group: mx.distributed.Group | None,
     on_prefill_progress: Callable[[int, int], None] | None,
     distributed_prompt_progress_callback: Callable[[], None] | None,
+    snapshots_sink: list[CacheSnapshot] | None = None,
 ) -> tuple[float, int, list[CacheSnapshot]]:
     """Prefill the KV cache with prompt tokens.
 
     This runs the model over the prompt tokens to populate the cache,
     then trims off the extra generated token.
+
+    When snapshots_sink is provided, snapshots accumulate into it so the
+    caller keeps the partial state even if PrefillCancelled unwinds — used
+    to bank interrupted prefills for retry resume.
 
     Returns:
         (tokens_per_sec, num_tokens, snapshots)
@@ -304,7 +309,9 @@ def prefill(
     logger.debug(f"Prefilling {num_tokens} tokens...")
     start_time = time.perf_counter()
     has_ssm = has_non_kv_caches(cache)
-    snapshots: list[CacheSnapshot] = []
+    snapshots: list[CacheSnapshot] = (
+        snapshots_sink if snapshots_sink is not None else []
+    )
 
     # TODO(evan): kill the callbacks/runner refactor
     def progress_callback(processed: int, total: int) -> None:
