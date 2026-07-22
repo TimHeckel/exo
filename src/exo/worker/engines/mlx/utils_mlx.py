@@ -27,6 +27,36 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.models.deepseek_v3 import DeepseekV3Model
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
+# poolside Laguna support: mlx-lm resolves architectures via
+# importlib.import_module("mlx_lm.models.<model_type>"), which consults
+# sys.modules first. Our pinned mlx-lm fork predates upstream PR #1334,
+# so register the vendored implementation until the pin catches up.
+from exo.worker.engines.mlx.models import laguna as _laguna
+
+sys.modules.setdefault("mlx_lm.models.laguna", _laguna)
+
+# transformers 5.6.x bug: with per-layer-type rope_parameters (Laguna's
+# config has separate yarn/default rope for full vs sliding attention), the
+# yarn validator's final factor double-check reads
+# self.rope_parameters["original_max_position_embeddings"] on the outer
+# nested dict instead of the per-layer dict it was passed, raising KeyError.
+# Everything before that line is real validation; the failing tail only
+# emits a warning. Fixed upstream in later 5.x — drop this when transformers
+# is bumped past 5.13.
+from transformers.modeling_rope_utils import RotaryEmbeddingConfigMixin as _RopeMixin
+
+_orig_validate_yarn = _RopeMixin._validate_yarn_rope_parameters
+
+
+def _validate_yarn_tolerant(self, rope_parameters, ignore_keys=None):
+    try:
+        _orig_validate_yarn(self, rope_parameters, ignore_keys=ignore_keys)
+    except KeyError:
+        pass
+
+
+_RopeMixin._validate_yarn_rope_parameters = _validate_yarn_tolerant
+
 from exo.shared.models.model_cards import ModelId
 from exo.worker.engines.mlx.constants import TRUST_REMOTE_CODE
 
@@ -321,6 +351,10 @@ def get_eos_token_ids_for_model(model_id: ModelId) -> list[int] | None:
     model_id_lower = model_id.lower()
     if "kimi-k2" in model_id_lower:
         return [163586]
+    elif "laguna" in model_id_lower:
+        # 2: 〈|EOS|〉, 24: </assistant> — the MLX export ships no
+        # generation_config.json, so the second stop token is lost without this
+        return [2, 24]
     elif "glm-5" in model_id_lower:
         # 154820: <|endoftext|>, 154827: <|user|>, 154829: <|observation|>
         return [154820, 154827, 154829]
