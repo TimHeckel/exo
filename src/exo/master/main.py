@@ -618,6 +618,21 @@ class Master:
                     logger.info(f"Manually removing node {node_id} due to inactivity")
                     await self.event_sender.send(NodeTimedOut(node_id=node_id))
 
+            # reap orphaned tasks: their instance is gone, so no terminal event
+            # will ever arrive, and Pending/Running they'd count as in-flight
+            # forever and skew the replica balancer toward the other instances
+            live_instances = set(self.state.instances.keys())
+            for task_id, task in self.state.tasks.items():
+                if (
+                    task.task_status in (TaskStatus.Pending, TaskStatus.Running)
+                    and task.instance_id not in live_instances
+                ):
+                    logger.info(
+                        f"Reaping orphaned task {task_id} (instance "
+                        f"{str(task.instance_id)[:8]} no longer exists)"
+                    )
+                    await self.event_sender.send(TaskDeleted(task_id=task_id))
+
             await anyio.sleep(10)
 
     async def _event_processor(self) -> None:
