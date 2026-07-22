@@ -421,6 +421,11 @@ async def generate_claude_stream(
 
     async for chunk in chunk_stream:
         if isinstance(chunk, PrefillProgressChunk):
+            # Long prefills (100k+ tokens, minutes on Apple Silicon) emit no
+            # tokens; Claude Code's stream-idle detector ignores SSE comments,
+            # so surface progress as protocol-valid ping events to keep the
+            # client from timing out before the first real chunk.
+            yield 'event: ping\ndata: {"type": "ping"}\n\n'
             continue
 
         if isinstance(chunk, ErrorChunk):

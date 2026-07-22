@@ -1549,6 +1549,9 @@ class API:
                         payload.model,
                         self._token_chunk_stream(command.command_id),
                     ),
+                    # Anthropic-protocol ping: SSE comments don't reset Claude
+                    # Code's stream-idle timer, real events do
+                    keepalive_message='event: ping\ndata: {"type": "ping"}\n\n',
                 ),
                 media_type="text/event-stream",
                 headers={
