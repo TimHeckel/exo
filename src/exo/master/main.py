@@ -1,4 +1,7 @@
+import hashlib
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import anyio
 from loguru import logger
@@ -72,6 +75,7 @@ from exo.shared.types.tasks import (
 from exo.shared.types.tasks import (
     TextGeneration as TextGenerationTask,
 )
+from exo.shared.types.text_generation import TextGenerationTaskParams
 from exo.shared.types.worker.instances import InstanceId
 from exo.utils.channels import Receiver, Sender
 from exo.utils.disk_event_log import DiskEventLog
@@ -156,20 +160,87 @@ def _log_balancer_choice(
 # processor handles commands one at a time, so no locking is needed.
 _BALANCER_RR: dict[str, int] = {}
 
+# Conversation -> instance affinity so consecutive turns of one conversation
+# land on the replica that holds its KV prefix cache. A re-prefill of a long
+# context costs minutes on Apple Silicon; queueing briefly behind a couple of
+# in-flight tasks is cheaper, hence AFFINITY_MAX_OVERLOAD. Same single-process
+# assumption as _BALANCER_RR.
+_BALANCER_AFFINITY: "OrderedDict[str, InstanceId]" = OrderedDict()
+_AFFINITY_MAX_ENTRIES = 256
+_AFFINITY_MAX_OVERLOAD = 2
+
+
+def _conversation_affinity_key(task_params: TextGenerationTaskParams) -> str | None:
+    """Stable fingerprint of a conversation across its turns: instructions plus
+    the first two messages (system prompt + first user message). Later turns
+    append messages, so this prefix identifies the conversation; different
+    sessions differ in their first user message. Never raises."""
+    try:
+        parts: list[str] = []
+        if task_params.instructions:
+            parts.append(str(task_params.instructions))
+        msgs: list[Any] = list(task_params.chat_template_messages or [])
+        if msgs:
+            for m in msgs[:2]:
+                parts.append(f"{m.get('role', '')}\x1f{m.get('content', '')}")
+        else:
+            for im in list(task_params.input or [])[:2]:
+                parts.append(f"{im.role}\x1f{im.content}")
+        if not parts:
+            return None
+        blob = "\x00".join(parts)[:4000]
+        return hashlib.sha256(blob.encode("utf-8", "ignore")).hexdigest()[:16]
+    except Exception:
+        return None
+
+
+def _remember_affinity(key: str, instance_id: InstanceId) -> None:
+    _BALANCER_AFFINITY[key] = instance_id
+    _BALANCER_AFFINITY.move_to_end(key)
+    while len(_BALANCER_AFFINITY) > _AFFINITY_MAX_ENTRIES:
+        _BALANCER_AFFINITY.popitem(last=False)
+
 
 def _select_balanced_instance(
-    instance_task_counts: dict[InstanceId, int], model: str
+    instance_task_counts: dict[InstanceId, int],
+    model: str,
+    affinity_key: str | None = None,
 ) -> InstanceId:
     """Pick the least in-flight instance; round-robin among those tied at the
     minimum so sequential traffic alternates across replicas instead of always
-    pinning to the same one. Under real concurrency this is still least-loaded."""
+    pinning to the same one. Under real concurrency this is still least-loaded.
+
+    When affinity_key is set and its remembered replica is within
+    _AFFINITY_MAX_OVERLOAD of the least-loaded count, stick to it so the
+    conversation reuses that replica's KV prefix cache instead of re-prefilling
+    its whole history elsewhere."""
     min_count = min(instance_task_counts.values())
+
+    if affinity_key is not None:
+        remembered = _BALANCER_AFFINITY.get(affinity_key)
+        if (
+            remembered is not None
+            and remembered in instance_task_counts
+            and instance_task_counts[remembered] <= min_count + _AFFINITY_MAX_OVERLOAD
+        ):
+            _BALANCER_AFFINITY.move_to_end(affinity_key)
+            logger.info(
+                f"[balancer] affinity {affinity_key} -> {str(remembered)[:8]} "
+                f"(inflight={instance_task_counts[remembered]}, min={min_count})"
+            )
+            return remembered
+
     tied = sorted(iid for iid, c in instance_task_counts.items() if c == min_count)
     if len(tied) == 1:
-        return tied[0]
-    idx = _BALANCER_RR.get(model, 0) % len(tied)
-    _BALANCER_RR[model] = idx + 1
-    return tied[idx]
+        chosen = tied[0]
+    else:
+        idx = _BALANCER_RR.get(model, 0) % len(tied)
+        _BALANCER_RR[model] = idx + 1
+        chosen = tied[idx]
+
+    if affinity_key is not None:
+        _remember_affinity(affinity_key, chosen)
+    return chosen
 
 
 class Master:
@@ -267,7 +338,11 @@ class Master:
                                 )
 
                             decode_instance_id = _select_balanced_instance(
-                                instance_task_counts, command.task_params.model
+                                instance_task_counts,
+                                command.task_params.model,
+                                affinity_key=_conversation_affinity_key(
+                                    command.task_params
+                                ),
                             )
                             _log_balancer_choice(
                                 self.state,
